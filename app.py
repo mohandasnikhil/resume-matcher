@@ -65,12 +65,6 @@ def skill_match_summary(candidate_text, jd_skills):
             missing.append(skill)
     return found, missing
 
-@st.cache_data
-def load_responses(path="data/responses.csv"):
-    if os.path.exists(path):
-        return pd.read_csv(path)
-    return pd.DataFrame(columns=["name", "email", "answers"])
-
 def parse_answers(answer_str):
     parts = [a.strip() for a in str(answer_str).split('|')]
     while len(parts) < 6:
@@ -91,67 +85,89 @@ def score_notice_period(periods):
     max_val, min_val = values.max(), values.min()
     return [round((max_val - v) / (max_val - min_val + 1e-5) * 10, 2) for v in values]
 
-# --- UI Starts Here ---
+# --- Streamlit App Starts Here ---
 
 st.title("📊 Smart Resume Screener")
-st.write("Paste your job description below to screen candidates against it:")
+st.write("Paste the job description and upload resumes below:")
 
-# New: Text area input for JD
+# 1. Job description input
 job_text = st.text_area("📝 Job Description", height=200)
 
-responses_df = load_responses()
-response_names = responses_df["name"].tolist()
+# 2. Upload LinkedIn responses (optional)
+responses_file = st.file_uploader("📎 Upload LinkedIn Answers CSV (Optional)", type=["csv"])
+responses_df = pd.read_csv(responses_file) if responses_file else None
+response_names = responses_df["name"].tolist() if responses_df is not None else []
 
-uploaded_files = st.file_uploader("📎 Upload resumes (PDF/DOCX)", type=["pdf", "docx"], accept_multiple_files=True)
+# 3. Upload resumes
+uploaded_files = st.file_uploader("📄 Upload Resumes (PDF/DOCX)", type=["pdf", "docx"], accept_multiple_files=True)
 
-if uploaded_files and job_text.strip() and not responses_df.empty:
+if uploaded_files and job_text.strip():
     jd_skills = extract_skills_from_jd(job_text)
     results = []
 
     for file in uploaded_files:
         resume_text = extract_text(file)
-        matched_name = extract_name_from_text(resume_text, response_names)
-        if not matched_name:
-            st.warning(f"❌ Could not match resume to any name in responses: {file.name}")
-            continue
 
-        match = responses_df[responses_df['name'].str.lower() == matched_name.lower()]
-        if match.empty:
-            st.warning(f"❌ No matching record in responses.csv for: {matched_name}")
-            continue
+        if responses_df is not None:
+            matched_name = extract_name_from_text(resume_text, response_names)
+            if not matched_name:
+                st.warning(f"❌ Could not match resume to any name in uploaded CSV: {file.name}")
+                continue
 
-        answers = parse_answers(match.iloc[0]['answers'])
-        if answers[0].lower() != "yes" or answers[1].lower() != "yes":
-            continue
+            match = responses_df[responses_df['name'].str.lower() == matched_name.lower()]
+            if match.empty:
+                st.warning(f"❌ No matching record in uploaded CSV for: {matched_name}")
+                continue
 
-        experience = answers[2]
-        education = answers[3]
-        salary = float(re.sub(r"[^\d.]", "", answers[4]) or 0)
-        notice = answers[5]
-        full_text = resume_text + "\n" + experience + "\n" + education
-        primary_score = get_similarity(full_text, job_text)
-        matched, missing = skill_match_summary(full_text, jd_skills)
+            answers = parse_answers(match.iloc[0]['answers'])
+            if answers[0].lower() != "yes" or answers[1].lower() != "yes":
+                continue  # Skip ineligible
 
-        results.append({
-            "name": matched_name.title(),
-            "score": primary_score,
-            "salary": salary,
-            "notice": notice,
-            "skills_matched": ", ".join(matched),
-            "skills_missing": ", ".join(missing)
-        })
+            experience = answers[2]
+            education = answers[3]
+            salary = float(re.sub(r"[^\d.]", "", answers[4]) or 0)
+            notice = answers[5]
+            full_text = resume_text + "\n" + experience + "\n" + education
+            primary_score = get_similarity(full_text, job_text)
+            matched, missing = skill_match_summary(full_text, jd_skills)
+
+            results.append({
+                "name": matched_name.title(),
+                "score": primary_score,
+                "salary": salary,
+                "notice": notice,
+                "skills_matched": ", ".join(matched),
+                "skills_missing": ", ".join(missing)
+            })
+
+        else:
+            # Resume-only mode
+            name = file.name.replace("_", " ").replace(".pdf", "").replace(".docx", "")
+            primary_score = get_similarity(resume_text, job_text)
+            matched, missing = skill_match_summary(resume_text, jd_skills)
+
+            results.append({
+                "name": name.title(),
+                "score": primary_score,
+                "salary": "N/A",
+                "notice": "N/A",
+                "skills_matched": ", ".join(matched),
+                "skills_missing": ", ".join(missing)
+            })
 
     if results:
         df = pd.DataFrame(results)
-        df["salary_score"] = score_salary(df["salary"])
-        df["notice_score"] = score_notice_period(df["notice"])
-        df["final_rank"] = (df["score"] * 0.7 + df["salary_score"] * 0.2 + df["notice_score"] * 0.1).round(2)
+        if responses_df is not None:
+            df["salary_score"] = score_salary(df["salary"])
+            df["notice_score"] = score_notice_period(df["notice"])
+            df["final_rank"] = (df["score"] * 0.7 + df["salary_score"] * 0.2 + df["notice_score"] * 0.1).round(2)
+        else:
+            df["final_rank"] = df["score"]
 
-        st.subheader("✅ Ranked & Matched Candidates")
+        st.subheader("✅ Ranked Candidates")
         sorted_df = df.sort_values("final_rank", ascending=False)
         st.dataframe(sorted_df, use_container_width=True)
 
-        # Download button
         csv = sorted_df.to_csv(index=False).encode('utf-8')
         st.download_button(
             label="📥 Download Results as CSV",
@@ -162,6 +178,4 @@ if uploaded_files and job_text.strip() and not responses_df.empty:
     else:
         st.warning("No eligible candidates matched.")
 elif not job_text.strip():
-    st.info("Please paste the job description above to begin.")
-elif responses_df.empty:
-    st.error("Missing or empty responses.csv in /data.")
+    st.info("Please enter a job description to continue.")
