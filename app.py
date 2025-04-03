@@ -2,6 +2,8 @@ import streamlit as st
 import os
 import tempfile
 import pandas as pd
+import zipfile
+from io import BytesIO
 from pdfminer.high_level import extract_text as extract_pdf
 from docx import Document
 from sentence_transformers import SentenceTransformer
@@ -11,21 +13,22 @@ import torch
 import re
 from difflib import get_close_matches
 
+# Load embedding model
 @st.cache_resource
 def load_model():
     return SentenceTransformer('all-MiniLM-L6-v2')
-
 model = load_model()
 
-def extract_text(file):
-    ext = os.path.splitext(file.name)[1].lower()
+# Resume parsing
+def extract_text(file_bytes, filename):
+    ext = os.path.splitext(filename)[1].lower()
+    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+        tmp.write(file_bytes.read())
+        tmp_path = tmp.name
     if ext == '.pdf':
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-            tmp.write(file.read())
-            text = extract_pdf(tmp.name)
-        return text
+        return extract_pdf(tmp_path)
     elif ext == '.docx':
-        doc = Document(file)
+        doc = Document(tmp_path)
         return "\n".join([para.text for para in doc.paragraphs])
     return ""
 
@@ -45,10 +48,7 @@ def safe_to_numpy(embedding):
 def get_similarity(text, job_text):
     emb_resume = model.encode(text, convert_to_tensor=True)
     emb_job = model.encode(job_text, convert_to_tensor=True)
-    emb_resume_np = safe_to_numpy(emb_resume)
-    emb_job_np = safe_to_numpy(emb_job)
-    sim = cosine_similarity([emb_resume_np], [emb_job_np])[0][0]
-    return round(sim * 10, 2)
+    return round(cosine_similarity([safe_to_numpy(emb_resume)], [safe_to_numpy(emb_job)])[0][0] * 10, 2)
 
 def extract_skills_from_jd(text):
     keywords = re.findall(r"\b(?:Python|NLP|machine learning|communication|data|SQL|deep learning|analytics|modeling|cloud|statistics|leadership|presentation|research|Excel|Tableau)\b", text, flags=re.I)
@@ -85,75 +85,75 @@ def score_notice_period(periods):
     max_val, min_val = values.max(), values.min()
     return [round((max_val - v) / (max_val - min_val + 1e-5) * 10, 2) for v in values]
 
-# --- Streamlit App Starts Here ---
+# UI starts
+st.title("📂 Batch Resume Screener")
+st.write("Upload a job description, a CSV of candidate answers (optional), and a ZIP file of resumes.")
 
-st.title("📊 Smart Resume Screener")
-st.write("Paste the job description and upload resumes below:")
-
-# 1. Job description input
 job_text = st.text_area("📝 Job Description", height=200)
 
-# 2. Upload LinkedIn responses (optional)
 responses_file = st.file_uploader("📎 Upload LinkedIn Answers CSV (Optional)", type=["csv"])
 responses_df = pd.read_csv(responses_file) if responses_file else None
 response_names = responses_df["name"].tolist() if responses_df is not None else []
 
-# 3. Upload resumes
-uploaded_files = st.file_uploader("📄 Upload Resumes (PDF/DOCX)", type=["pdf", "docx"], accept_multiple_files=True)
+zip_file = st.file_uploader("📄 Upload Resumes (ZIP of PDFs/DOCXs)", type=["zip"])
 
-if uploaded_files and job_text.strip():
+if zip_file and job_text.strip():
     jd_skills = extract_skills_from_jd(job_text)
     results = []
 
-    for file in uploaded_files:
-        resume_text = extract_text(file)
+    with zipfile.ZipFile(zip_file) as archive:
+        resume_files = [f for f in archive.namelist() if f.endswith(('.pdf', '.docx'))]
 
-        if responses_df is not None:
-            matched_name = extract_name_from_text(resume_text, response_names)
-            if not matched_name:
-                st.warning(f"❌ Could not match resume to any name in uploaded CSV: {file.name}")
-                continue
+        for filename in resume_files:
+            file_bytes = BytesIO(archive.read(filename))
+            resume_text = extract_text(file_bytes, filename)
 
-            match = responses_df[responses_df['name'].str.lower() == matched_name.lower()]
-            if match.empty:
-                st.warning(f"❌ No matching record in uploaded CSV for: {matched_name}")
-                continue
+            # Resume-only fallback
+            if responses_df is None:
+                name = resume_text.strip().split('\n')[0].strip()
+                score = get_similarity(resume_text, job_text)
+                matched, missing = skill_match_summary(resume_text, jd_skills)
 
-            answers = parse_answers(match.iloc[0]['answers'])
-            if answers[0].lower() != "yes" or answers[1].lower() != "yes":
-                continue  # Skip ineligible
+                results.append({
+                    "name": name,
+                    "score": score,
+                    "salary": "N/A",
+                    "notice": "N/A",
+                    "skills_matched": ", ".join(matched),
+                    "skills_missing": ", ".join(missing)
+                })
 
-            experience = answers[2]
-            education = answers[3]
-            salary = float(re.sub(r"[^\d.]", "", answers[4]) or 0)
-            notice = answers[5]
-            full_text = resume_text + "\n" + experience + "\n" + education
-            primary_score = get_similarity(full_text, job_text)
-            matched, missing = skill_match_summary(full_text, jd_skills)
+            else:
+                matched_name = extract_name_from_text(resume_text, response_names)
+                if not matched_name:
+                    st.warning(f"❌ Could not match resume to any name in uploaded CSV: {filename}")
+                    continue
 
-            results.append({
-                "name": matched_name.title(),
-                "score": primary_score,
-                "salary": salary,
-                "notice": notice,
-                "skills_matched": ", ".join(matched),
-                "skills_missing": ", ".join(missing)
-            })
+                match = responses_df[responses_df['name'].str.lower() == matched_name.lower()]
+                if match.empty:
+                    st.warning(f"❌ No match in CSV for: {matched_name}")
+                    continue
 
-        else:
-            # Resume-only mode
-            name = file.name.replace("_", " ").replace(".pdf", "").replace(".docx", "")
-            primary_score = get_similarity(resume_text, job_text)
-            matched, missing = skill_match_summary(resume_text, jd_skills)
+                answers = parse_answers(match.iloc[0]['answers'])
+                if answers[0].lower() != "yes" or answers[1].lower() != "yes":
+                    continue
 
-            results.append({
-                "name": name.title(),
-                "score": primary_score,
-                "salary": "N/A",
-                "notice": "N/A",
-                "skills_matched": ", ".join(matched),
-                "skills_missing": ", ".join(missing)
-            })
+                experience = answers[2]
+                education = answers[3]
+                salary = float(re.sub(r"[^\d.]", "", answers[4]) or 0)
+                notice = answers[5]
+                full_text = resume_text + "\n" + experience + "\n" + education
+                score = get_similarity(full_text, job_text)
+                matched, missing = skill_match_summary(full_text, jd_skills)
+
+                results.append({
+                    "name": matched_name.title(),
+                    "score": score,
+                    "salary": salary,
+                    "notice": notice,
+                    "skills_matched": ", ".join(matched),
+                    "skills_missing": ", ".join(missing)
+                })
 
     if results:
         df = pd.DataFrame(results)
